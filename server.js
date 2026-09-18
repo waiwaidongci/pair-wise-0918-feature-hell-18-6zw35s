@@ -42,6 +42,25 @@ const initialData = {
   ]
 };
 
+const LOOP_STATUS = Object.freeze({
+  NOT_STARTED: { code: "NOT_STARTED", text: "尚未开始调校" },
+  PENDING_RETEST: { code: "PENDING_RETEST", text: "最新调校尚无复测" },
+  AWAITING_ADJUSTMENT: { code: "AWAITING_ADJUSTMENT", text: "最新复测不合格，可继续调校" },
+  CLOSED_QUALIFIED: { code: "CLOSED_QUALIFIED", text: "最新复测合格，闭环已关闭" }
+});
+
+const STEP_STATUS = Object.freeze({
+  PENDING_RETEST: { code: "PENDING_RETEST", text: "待复测", closedLoop: false },
+  RETEST_NOT_QUALIFIED: { code: "RETEST_NOT_QUALIFIED", text: "复测不合格", closedLoop: true },
+  RETEST_QUALIFIED: { code: "RETEST_QUALIFIED", text: "复测合格", closedLoop: true }
+});
+
+function fail(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  throw error;
+}
+
 const routes = [
   "GET /health",
   "GET /clocks",
@@ -126,14 +145,55 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function retestForAdjustment(db, adjustmentId) {
+  // 一次调校只对应一次复测；兼容历史脏数据时取时间最新的一条
+  return db.retests
+    .filter((item) => item.adjustmentId === adjustmentId)
+    .sort((a, b) => new Date(b.testedAt) - new Date(a.testedAt))[0] || null;
+}
+
+function loopStatus(db, clockId) {
+  const adjustment = latestAdjustment(db, clockId);
+  if (!adjustment) return LOOP_STATUS.NOT_STARTED;
+  const retest = retestForAdjustment(db, adjustment.id);
+  if (!retest) return LOOP_STATUS.PENDING_RETEST;
+  return retest.qualified ? LOOP_STATUS.CLOSED_QUALIFIED : LOOP_STATUS.AWAITING_ADJUSTMENT;
+}
+
+function historySteps(db, clockId) {
+  return db.adjustments
+    .filter((item) => item.clockId === clockId)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .map((adjustment, index) => {
+      const retest = retestForAdjustment(db, adjustment.id);
+      const status = !retest
+        ? STEP_STATUS.PENDING_RETEST
+        : retest.qualified
+          ? STEP_STATUS.RETEST_QUALIFIED
+          : STEP_STATUS.RETEST_NOT_QUALIFIED;
+      return {
+        seq: index + 1,
+        adjustment,
+        retest,
+        stepStatus: status.code,
+        stepStatusText: status.text,
+        closedLoop: status.closedLoop
+      };
+    });
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const status = loopStatus(db, clock.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: retest ? retest.qualified : false,
+    loopStatus: status.code,
+    loopStatusText: status.text,
+    closedLoop: status.code === LOOP_STATUS.CLOSED_QUALIFIED.code
   };
 }
 
@@ -181,9 +241,25 @@ async function handle(req, res) {
   const historyMatch = pathname.match(/^\/clocks\/([^/]+)\/history$/);
   if (historyMatch && req.method === "GET") {
     const clock = findClock(db, historyMatch[1]);
-    const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
-    const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const adjustments = db.adjustments
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    const retests = db.retests
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(a.testedAt) - new Date(b.testedAt));
+    const status = loopStatus(db, clock.id);
+    return send(res, 200, {
+      data: {
+        clock,
+        steps: historySteps(db, clock.id),
+        adjustments,
+        retests,
+        latestRetest: latestRetest(db, clock.id),
+        loopStatus: status.code,
+        loopStatusText: status.text,
+        closedLoop: status.code === LOOP_STATUS.CLOSED_QUALIFIED.code
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -191,18 +267,34 @@ async function handle(req, res) {
     const clock = findClock(db, adjustmentMatch[1]);
     const body = await parseBody(req);
     required(body, ["currentDailyRateSeconds", "direction", "amount"]);
+
+    // 闭环闸门：以下校验全部通过后才允许写入，任何拒绝都不改变原档案
+    const latestAdj = latestAdjustment(db, clock.id);
+    if (latestAdj && !retestForAdjustment(db, latestAdj.id)) {
+      fail(409, "最新调校尚无复测，必须先完成复测才能再次调校");
+    }
+    const latest = latestRetest(db, clock.id);
+    const reworkReason = (body.reworkReason || "").trim();
+    if (latest && latest.qualified && !reworkReason) {
+      // 合格后继续调校属于返修，必须写明返修原因；
+      // 最新复测不合格时为正常返修，返修原因可选
+      fail(400, "最新复测已合格，继续调校必须写明返修原因（reworkReason）");
+    }
+
     const adjustment = {
       id: makeId("adjustment"),
       clockId: clock.id,
       currentDailyRateSeconds: Number(body.currentDailyRateSeconds),
       direction: body.direction,
       amount: body.amount,
+      basedOnRetestId: latest ? latest.id : null,
+      reworkReason,
       note: body.note || "",
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, clock: clockSummary(db, clock) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -210,14 +302,30 @@ async function handle(req, res) {
     const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
-    const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
+
+    // 闭环闸门：一次调校只允许一次复测，且只能复测最新调校
+    const latestAdj = latestAdjustment(db, clock.id);
+    if (!latestAdj) {
+      fail(409, "该钟表尚无调校记录，无法复测");
+    }
+    if (body.adjustmentId && body.adjustmentId !== latestAdj.id) {
+      const target = db.adjustments.find(
+        (item) => item.id === body.adjustmentId && item.clockId === clock.id
+      );
+      if (!target) fail(404, "指定的调校记录不存在");
+      fail(409, "只能对最新一次调校进行复测");
+    }
+    if (retestForAdjustment(db, latestAdj.id)) {
+      fail(409, "最新调校已有复测，不能重复复测");
+    }
+
     const qualified = body.qualified !== undefined
       ? Boolean(body.qualified)
       : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
     const retest = {
       id: makeId("retest"),
       clockId: clock.id,
-      adjustmentId,
+      adjustmentId: latestAdj.id,
       testedAt: body.testedAt || new Date().toISOString(),
       dailyRateSeconds: Number(body.dailyRateSeconds),
       amplitude: Number(body.amplitude),
